@@ -15,7 +15,31 @@ from sb3_contrib.ppo_recurrent.ppo_recurrent import RecurrentPPO
 from sb3_contrib.common.recurrent.buffers import RecurrentDictRolloutBuffer, RecurrentRolloutBuffer
 
 from sb3_vpt.buffer import VPTBuffer
+import wandb
+import moviepy, imageio # Not used in script but used in background by wandb for logging videos, do pip install moviepy imageio
+from collections import namedtuple, deque
+import random
 
+Rollout = namedtuple('Rollout',
+                        ('states', 'actions'))
+
+
+class ReplayMemory(object):
+
+    def __init__(self, capacity,si_counter = 1):
+        self.memory = deque([],maxlen=capacity)
+        self.si_counter = si_counter
+        self.average_reward = 0
+
+    def push(self, *args):
+        """Save a transition"""
+        self.memory.append(Rollout(*args))
+
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
+
+    def __len__(self):
+        return len(self.memory)
 
 class VPTPPO(RecurrentPPO):
     def __init__(self, *args, kl_coef=.2, kl_decay=.9995, use_task_ids=False, n_tasks=1, **kwargs):
@@ -24,6 +48,10 @@ class VPTPPO(RecurrentPPO):
         self.kl_decay = kl_decay
         self.use_task_ids = use_task_ids
         self.n_tasks = n_tasks
+        run = wandb.init(
+            project="deckard"
+        )
+
         super().__init__(*args, **kwargs)
 
     def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
@@ -143,6 +171,12 @@ class VPTPPO(RecurrentPPO):
                 clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
             new_obs, rewards, dones, infos = env.step(clipped_actions)
+            max_abs_reward_index = np.argmax(np.abs(rewards))
+            
+            if abs(rewards[max_abs_reward_index]) > 1
+                next_obs = new_obs[max_abs_reward_index]
+                images = wandb.Image(next_obs, caption=f"reward spike: {rewards[max_abs_reward_index]}")
+                wandb.log({"examples": images})
 
             self.num_timesteps += env.num_envs
 
@@ -235,6 +269,7 @@ class VPTPPO(RecurrentPPO):
 
         continue_training = True
 
+        print("start training")
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
             approx_kl_divs = []
@@ -324,6 +359,8 @@ class VPTPPO(RecurrentPPO):
         self._n_updates += self.n_epochs
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
+        print("start logging")
+        print(self.num_timesteps)
         # Logs
         if len(bc_losses) > 0:
             self.logger.record("train/bc_loss", np.mean(bc_losses))
@@ -343,3 +380,30 @@ class VPTPPO(RecurrentPPO):
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
+
+        # Wandb logs
+        if len(bc_losses) > 0:
+            wandb.log({"train/bc_loss": np.mean(bc_losses)}, step=self.num_timesteps)
+
+        wandb.log({
+            "train/kl_loss": np.mean(kl_losses),
+            "train/kl_coef": self.kl_coef,
+            "train/policy_gradient_loss": np.mean(pg_losses),
+            "train/value_loss": np.mean(value_losses),
+            "train/approx_kl": np.mean(approx_kl_divs),
+            "train/clip_fraction": np.mean(clip_fractions),
+            "train/avg_loss": np.mean(losses),
+            "train/loss": loss.item(),
+            "train/explained_variance": explained_var,
+            "train/n_updates": self._n_updates,
+            "train/clip_range": clip_range
+        }, step=self.num_timesteps)
+
+        if hasattr(self.policy, "log_std"):
+            wandb.log({"train/std": th.exp(self.policy.log_std).mean().item()}, step=self.num_timesteps)
+
+        if self.clip_range_vf is not None:
+            wandb.log({"train/clip_range_vf": clip_range_vf}, step=self.num_timesteps)
+
+
+            
